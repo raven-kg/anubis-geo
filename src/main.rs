@@ -1,0 +1,995 @@
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use anyhow::Context;
+use ipnet::IpNet;
+use maxminddb::{geoip2, Reader};
+use moka::future::Cache;
+use tokio::signal;
+use tokio::sync::RwLock;
+use tonic::{transport::Server, Request, Response, Status, metadata::MetadataMap};
+use tracing::{info, warn, error, debug};
+use sqlx::{SqlitePool, Row, Executor};
+use tokio_cron_scheduler::{JobScheduler, Job};
+use bzip2::read::BzDecoder;
+
+pub mod techaro {
+    pub mod thoth {
+        pub mod iptoasn {
+            pub mod v1 {
+                tonic::include_proto!("techaro.thoth.iptoasn.v1");
+            }
+        }
+        pub mod reputation {
+            pub mod v1 {
+                tonic::include_proto!("techaro.thoth.reputation.v1");
+            }
+        }
+    }
+}
+
+use techaro::thoth::iptoasn::v1::{
+    ip_to_asn_service_server::{IpToAsnService, IpToAsnServiceServer},
+    LookupRequest, LookupResponse,
+};
+use techaro::thoth::reputation::v1::{
+    repute_service_server::{ReputeService, ReputeServiceServer},
+    ReputeServiceQueryRequest, ReputeServiceQueryResponse, IpList,
+};
+
+/// BGP prefix information stored in database
+#[derive(Clone, Debug)]
+struct BgpPrefix {
+    prefix: IpNet,
+    asn: u32,
+    description: String,
+    country_code: String,
+    registry: String,
+    last_updated: chrono::DateTime<chrono::Utc>,
+}
+
+impl BgpPrefix {
+    /// Create from database row
+    fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+        let prefix_str: String = row.try_get("prefix")?;
+        let prefix = prefix_str.parse::<IpNet>()
+            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+
+        Ok(BgpPrefix {
+            prefix,
+            asn: row.try_get::<i64, _>("asn")? as u32,
+            description: row.try_get("description")?,
+            country_code: row.try_get("country_code")?,
+            registry: row.try_get("registry")?,
+            last_updated: chrono::DateTime::parse_from_rfc3339(&row.try_get::<String, _>("last_updated")?)
+                .map_err(|e| sqlx::Error::Decode(Box::new(e)))?
+                .with_timezone(&chrono::Utc),
+        })
+    }
+}
+
+/// Cached BGP lookup result with TTL
+#[derive(Clone, Debug)]
+struct CachedBgpResult {
+    prefix: Option<BgpPrefix>,
+    cached_at: std::time::Instant,
+    ttl: Duration,
+}
+
+impl CachedBgpResult {
+    fn new(prefix: Option<BgpPrefix>, ttl: Duration) -> Self {
+        Self {
+            prefix,
+            cached_at: std::time::Instant::now(),
+            ttl,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.cached_at.elapsed() > self.ttl
+    }
+}
+
+/// BGP data storage and caching layer
+#[derive(Clone)]
+struct BgpStorage {
+    pool: SqlitePool,
+    client: reqwest::Client,
+    /// Cache for IP -> BGP prefix lookups (short-lived, 5-10 minutes)
+    lookup_cache: Cache<std::net::IpAddr, CachedBgpResult>,
+}
+
+impl BgpStorage {
+    /// Initialize BGP storage with SQLite database
+    async fn new(database_path: &str) -> anyhow::Result<Self> {
+        let pool = SqlitePool::connect(database_path).await?;
+        let pool2 = pool.clone();
+        // Create tables if they don't exist
+        pool2.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS bgp_prefixes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prefix TEXT NOT NULL UNIQUE,
+                asn INTEGER NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                country_code TEXT NOT NULL DEFAULT '',
+                registry TEXT NOT NULL DEFAULT '',
+                last_updated TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_prefix ON bgp_prefixes (prefix);
+            CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_asn ON bgp_prefixes (asn);
+            CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_updated ON bgp_prefixes (last_updated);
+            CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_country ON bgp_prefixes (country_code);
+            "#
+        ).await?;
+
+        let storage = Self {
+            pool,
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .user_agent("GeoIP-BGP-Service/1.0")
+                .build()?,
+            lookup_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(300)) // 5 minutes TTL
+                .max_capacity(10_000) // Limit memory usage
+                .build(),
+        };
+
+        Ok(storage)
+    }
+
+    /// Find the most specific BGP prefix for an IP address
+    async fn find_prefix(&self, ip: std::net::IpAddr) -> anyhow::Result<Option<BgpPrefix>> {
+        // Check cache first
+        if let Some(cached) = self.lookup_cache.get(&ip).await {
+            if !cached.is_expired() {
+                debug!("BGP cache hit for {}", ip);
+                return Ok(cached.prefix);
+            }
+        }
+
+        debug!("BGP cache miss for {}, querying database", ip);
+
+        // Query database for matching prefixes
+        let ip_str = ip.to_string();
+        let rows = sqlx::query(
+            "SELECT prefix, asn, description, country_code, registry, last_updated
+            FROM bgp_prefixes
+            WHERE ? BETWEEN inet_aton(substr(prefix, 1, instr(prefix, '/') - 1))
+                AND inet_aton(substr(prefix, 1, instr(prefix, '/') - 1)) +
+                    (CASE WHEN substr(prefix, instr(prefix, '/') + 1) = '32' THEN 0
+                          ELSE (1 << (32 - CAST(substr(prefix, instr(prefix, '/') + 1) AS INTEGER))) - 1 END)
+            ORDER BY CAST(substr(prefix, instr(prefix, '/') + 1) AS INTEGER) DESC
+            LIMIT 1"
+        )
+            .bind(ip_str)
+            .fetch_all(&self.pool)
+            .await?;
+        let prefix = if let Some(row) = rows.first() {
+            match BgpPrefix::from_row(row) {
+                Ok(prefix) => Some(prefix),
+                Err(e) => {
+                    warn!("Failed to parse BGP prefix from row: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        /*let prefix = match rows {
+            Ok(mut prefixes) => prefixes.pop(),
+            Err(e) => {
+                warn!("Database query error for {}: {}", ip, e);
+                None
+            }
+        };*/
+
+        // If no result in DB, try to fetch from external APIs
+        let final_prefix = if prefix.is_none() {
+            self.fetch_and_store_prefix(ip).await?
+        } else {
+            prefix
+        };
+
+        // Cache the result (even if None)
+        let cached_result = CachedBgpResult::new(final_prefix.clone(), Duration::from_secs(300));
+        self.lookup_cache.insert(ip, cached_result).await;
+
+        Ok(final_prefix)
+    }
+
+    /// Simplified find_prefix method
+    async fn find_prefix_simple(&self, ip: std::net::IpAddr) -> Option<BgpPrefix> {
+        match self.find_prefix(ip).await {
+            Ok(prefix) => prefix,
+            Err(_) => None,
+        }
+    }
+
+    /// Fetch BGP prefix from external APIs and store in database
+    async fn fetch_and_store_prefix(&self, ip: std::net::IpAddr) -> anyhow::Result<Option<BgpPrefix>> {
+        debug!("Fetching BGP data from external APIs for {}", ip);
+
+        // Try BGPView API first
+        if let Some(prefix) = self.fetch_from_bgpview(ip).await? {
+            self.store_prefix(&prefix).await?;
+            return Ok(Some(prefix));
+        }
+
+        // Fallback to RIPE Stat API
+        if let Some(prefix) = self.fetch_from_ripe_stat(ip).await? {
+            self.store_prefix(&prefix).await?;
+            return Ok(Some(prefix));
+        }
+
+        Ok(None)
+    }
+
+    /// Fetch BGP data from BGPView API
+    async fn fetch_from_bgpview(&self, ip: std::net::IpAddr) -> anyhow::Result<Option<BgpPrefix>> {
+        let url = format!("https://api.bgpview.io/ip/{}", ip);
+
+        let response = match self.client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => resp,
+            Ok(resp) => {
+                debug!("BGPView API returned status: {}", resp.status());
+                return Ok(None);
+            }
+            Err(e) => {
+                warn!("BGPView API request failed: {}", e);
+                return Ok(None);
+            }
+        };
+
+        let json: serde_json::Value = response.json().await.map_err(|e| anyhow::anyhow!("JSON parse error: {}", e))?;
+
+        if let Some(data) = json.get("data") {
+            if let Some(prefixes) = data.get("prefixes").and_then(|p| p.as_array()) {
+                if let Some(prefix_data) = prefixes.first() {
+                    let prefix_str = prefix_data.get("prefix")
+                        .and_then(|p| p.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("Missing prefix in BGPView response"))?;
+
+                    let prefix: IpNet = prefix_str.parse()?;
+
+                    let asn_data = prefix_data.get("asn")
+                        .ok_or_else(|| anyhow::anyhow!("Missing ASN data in BGPView response"))?;
+
+                    let asn = asn_data.get("asn")
+                        .and_then(|a| a.as_u64())
+                        .ok_or_else(|| anyhow::anyhow!("Invalid ASN in BGPView response"))? as u32;
+
+                    let description = asn_data.get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let country_code = asn_data.get("country_code")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    return Ok(Some(BgpPrefix {
+                        prefix,
+                        asn,
+                        description,
+                        country_code,
+                        registry: "bgpview".to_string(),
+                        last_updated: chrono::Utc::now(),
+                    }));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Fetch BGP data from RIPE Stat API
+    async fn fetch_from_ripe_stat(&self, ip: std::net::IpAddr) -> anyhow::Result<Option<BgpPrefix>> {
+        let url = format!("https://stat.ripe.net/data/network-info/data.json?resource={}", ip);
+
+        let response = match self.client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => resp,
+            Ok(resp) => {
+                debug!("RIPE Stat API returned status: {}", resp.status());
+                return Ok(None);
+            }
+            Err(e) => {
+                warn!("RIPE Stat API request failed: {}", e);
+                return Ok(None);
+            }
+        };
+
+        let json: serde_json::Value = response.json().await.map_err(|e| anyhow::anyhow!("JSON parse error: {}", e))?;
+
+        if let Some(data) = json.get("data") {
+            let prefix_str = data.get("prefix")
+                .and_then(|p| p.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing prefix in RIPE response"))?;
+
+            let prefix: IpNet = prefix_str.parse()?;
+
+            let asn = data.get("asns")
+                .and_then(|a| a.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|asn| asn.as_u64())
+                .unwrap_or(0) as u32;
+
+            return Ok(Some(BgpPrefix {
+                prefix,
+                asn,
+                description: String::new(), // RIPE Stat doesn't always provide description
+                country_code: String::new(),
+                registry: "ripe".to_string(),
+                last_updated: chrono::Utc::now(),
+            }));
+        }
+
+        Ok(None)
+    }
+
+    /// Store BGP prefix in database
+    async fn store_prefix(&self, prefix: &BgpPrefix) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO bgp_prefixes
+            (prefix, asn, description, country_code, registry, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#
+        )
+            .bind(prefix.prefix.to_string())
+            .bind(prefix.asn as i64)
+            .bind(&prefix.description)
+            .bind(&prefix.country_code)
+            .bind(&prefix.registry)
+            .bind(prefix.last_updated.to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+
+        debug!("Stored BGP prefix {} in database", prefix.prefix);
+        Ok(())
+    }
+
+    /// Bulk update BGP data from RIR delegated statistics
+    async fn update_bgp_data(&self) -> anyhow::Result<()> {
+        info!("Starting full BGP data update from RIR sources");
+
+        let mut _prefixes = Vec::new();
+
+        // Fetch from all RIR sources
+        for (registry, url) in &[
+            ("ripencc", "https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-extended-latest"),
+            ("arin", "https://ftp.arin.net/pub/stats/arin/delegated-arin-extended-latest"),
+            ("apnic", "https://ftp.apnic.net/pub/stats/apnic/delegated-apnic-extended-latest"),
+            ("lacnic", "https://ftp.lacnic.net/pub/stats/lacnic/delegated-lacnic-extended-latest"),
+            ("afrinic", "https://ftp.afrinic.net/pub/stats/afrinic/delegated-afrinic-extended-latest"),
+        ] {
+            match self.fetch_delegated_stats(registry, url).await {
+                Ok(mut prefixes) => {
+                    info!("Fetched {} prefixes from {}", prefixes.len(), registry);
+                    _prefixes.append(&mut prefixes);
+                }
+                Err(e) => warn!("Failed to fetch data from {}: {}", registry, e),
+            }
+        }
+
+        // Fetch RouteViews ASN data for better ASN coverage
+        match self.fetch_routeviews_asn_data().await {
+            Ok(asn_map) => {
+                info!("Fetched {} ASN mappings from RouteViews", asn_map.len());
+                self.enrich_prefixes(&mut _prefixes, &asn_map);
+            }
+            Err(e) => warn!("Failed to fetch RouteViews data: {}", e),
+        }
+
+        info!("Total prefixes collected: {}", _prefixes.len());
+
+        // Bulk insert into database
+        self.insert_prefixes(_prefixes).await?;
+
+        info!("BGP data update completed successfully");
+        Ok(())
+    }
+
+    /// Fetch and parse RIR delegated statistics
+    async fn fetch_delegated_stats(&self, registry: &str, url: &str) -> anyhow::Result<Vec<BgpPrefix>> {
+        debug!("Fetching delegated stats from {}: {}", registry, url);
+
+        let response = self.client.get(url).send().await?;
+        let content = response.text().await?;
+
+        self.parse_delegated_stats(registry, &content).await
+    }
+
+    /// Parse RIR delegated statistics format
+    async fn parse_delegated_stats(&self, _registry: &str, content: &str) -> anyhow::Result<Vec<BgpPrefix>> {
+        let mut prefixes = Vec::new();
+        let mut line_count = 0;
+
+        for line in content.lines() {
+            line_count += 1;
+
+            // Skip comments and metadata
+            if line.starts_with('#') || line.is_empty() || line_count <= 5 {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split('|').collect();
+            if parts.len() < 7 {
+                continue;
+            }
+
+            let reg = parts[0];
+            let cc = parts[1];
+            let type_field = parts[2];
+            let start = parts[3];
+            let value = parts[4];
+            let status = parts[6];
+
+            // Only process assigned and allocated resources
+            if status != "assigned" && status != "allocated" {
+                continue;
+            }
+
+            match type_field {
+                "ipv4" => {
+                    if let (Ok(start_ip), Ok(count)) = (
+                        start.parse::<std::net::Ipv4Addr>(),
+                        value.parse::<u32>()
+                    ) {
+                        // Calculate prefix length from IP count
+                        if count > 0 && (count & (count - 1)) == 0 { // Power of 2
+                            let prefix_len = 32 - count.trailing_zeros() as u8;
+                            if let Ok(cidr) = format!("{}/{}", start_ip, prefix_len).parse::<IpNet>() {
+                                prefixes.push(BgpPrefix {
+                                    prefix: cidr,
+                                    asn: 0, // Will be filled later from RouteViews data
+                                    description: format!("{} allocation", cc.to_uppercase()),
+                                    country_code: cc.to_string(),
+                                    registry: reg.to_string(),
+                                    last_updated: chrono::Utc::now(),
+                                });
+                            }
+                        }
+                    }
+                }
+                "ipv6" => {
+                    if let Ok(prefix_len) = value.parse::<u8>() {
+                        if let Ok(cidr) = format!("{}/{}", start, prefix_len).parse::<IpNet>() {
+                            prefixes.push(BgpPrefix {
+                                prefix: cidr,
+                                asn: 0,
+                                description: format!("{} allocation", cc.to_uppercase()),
+                                country_code: cc.to_string(),
+                                registry: reg.to_string(),
+                                last_updated: chrono::Utc::now(),
+                            });
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        Ok(prefixes)
+    }
+
+    /// Fetch ASN to prefix mappings from RouteViews
+    async fn fetch_routeviews_asn_data(&self) -> anyhow::Result<std::collections::HashMap<IpNet, u32>> {
+        let url = "http://archive.routeviews.org/dnszones/originas.bz2";
+
+        let response = self.client.get(url).send().await?;
+        let compressed_data = response.bytes().await?;
+
+        // Decompress bz2 data
+        let cursor = std::io::Cursor::new(compressed_data);
+        let mut decoder = BzDecoder::new(cursor);
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut content)?;
+
+        let mut asn_map = std::collections::HashMap::new();
+
+        // Parse originas format: "prefix origin_asn"
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let (Ok(prefix), Ok(asn)) = (
+                    parts[0].parse::<IpNet>(),
+                    parts[1].parse::<u32>()
+                ) {
+                    asn_map.insert(prefix, asn);
+                }
+            }
+        }
+
+        Ok(asn_map)
+    }
+
+    /// Enrich prefix data with ASN information from RouteViews
+    fn enrich_prefixes(
+        &self,
+        prefixes: &mut Vec<BgpPrefix>,
+        asn_map: &std::collections::HashMap<IpNet, u32>
+    ) {
+        for prefix in prefixes.iter_mut() {
+            if prefix.asn == 0 {
+                // Look for exact match or containing prefix
+                if let Some(&asn) = asn_map.get(&prefix.prefix) {
+                    prefix.asn = asn;
+                } else {
+                    // Find most specific containing prefix
+                    let mut best_asn = 0;
+                    let mut best_len = 0u8;
+
+                    for (net, &asn) in asn_map {
+                        if net.contains(&prefix.prefix.network()) {
+                            let len = match net {
+                                IpNet::V4(n) => n.prefix_len(),
+                                IpNet::V6(n) => n.prefix_len(),
+                            };
+                            if len > best_len {
+                                best_len = len;
+                                best_asn = asn;
+                            }
+                        }
+                    }
+
+                    if best_asn != 0 {
+                        prefix.asn = best_asn;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bulk insert prefixes into database with transaction
+    async fn insert_prefixes(&self, prefixes: Vec<BgpPrefix>) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // Clean up old data (older than 30 days)
+        sqlx::query("DELETE FROM bgp_prefixes WHERE last_updated < datetime('now', '-30 days')")
+            .execute(&mut *tx)
+            .await?;
+
+        // Insert new data in batches
+        const BATCH_SIZE: usize = 1000;
+        let total_batches = (prefixes.len() + BATCH_SIZE - 1) / BATCH_SIZE;
+
+        for (batch_idx, chunk) in prefixes.chunks(BATCH_SIZE).enumerate() {
+            info!("Inserting batch {}/{} ({} prefixes)", batch_idx + 1, total_batches, chunk.len());
+
+            for prefix in chunk {
+                sqlx::query(
+                    r#"
+                    INSERT OR REPLACE INTO bgp_prefixes
+                    (prefix, asn, description, country_code, registry, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    "#
+                )
+                    .bind(prefix.prefix.to_string())
+                    .bind(prefix.asn as i64)
+                    .bind(&prefix.description)
+                    .bind(&prefix.country_code)
+                    .bind(&prefix.registry)
+                    .bind(prefix.last_updated.to_rfc3339())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        tx.commit().await?;
+        info!("Successfully inserted {} prefixes into database", prefixes.len());
+
+        Ok(())
+    }
+
+    /// Get cache statistics for monitoring
+    fn get_cache_stats(&self) -> (u64, u64) {
+        (self.lookup_cache.entry_count(), self.lookup_cache.weighted_size())
+    }
+}
+
+#[derive(Clone)]
+struct Dbs {
+    country: Option<Arc<Reader<Vec<u8>>>>,
+    asn: Option<Arc<Reader<Vec<u8>>>>,
+}
+
+#[derive(Clone)]
+struct PrefixEntry {
+    net: IpNet,
+    resp: LookupResponse,
+    prefix_len: u8,
+}
+
+#[derive(Clone)]
+struct Shared {
+    dbs: Arc<RwLock<Dbs>>,
+    ip_cache: Cache<String, LookupResponse>,
+    prefix_cache: Arc<RwLock<Vec<PrefixEntry>>>,
+    bgp_storage: BgpStorage,
+    token: Option<String>,
+}
+
+impl Shared {
+    async fn new(dbs: Dbs, ttl: Duration, token: Option<String>, database_path: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            dbs: Arc::new(RwLock::new(dbs)),
+            ip_cache: Cache::builder().time_to_live(ttl).build(),
+            prefix_cache: Arc::new(RwLock::new(Vec::new())),
+            bgp_storage: BgpStorage::new(database_path).await?,
+            token,
+        })
+    }
+
+    fn check_auth(&self, md: &MetadataMap) -> Result<(), Status> {
+        if let Some(t) = &self.token {
+            match md.get("authorization").and_then(|v| v.to_str().ok()) {
+                Some(s) if s.starts_with("Bearer ") && &s["Bearer ".len()..] == t => Ok(()),
+                _ => Err(Status::unauthenticated("invalid authorization token")),
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IpToAsnSvc {
+    shared: Shared,
+}
+
+#[tonic::async_trait]
+impl IpToAsnService for IpToAsnSvc {
+    async fn lookup(&self, req: Request<LookupRequest>) -> Result<Response<LookupResponse>, Status> {
+        self.shared.check_auth(req.metadata())?;
+        let ip = req.into_inner().ip_address;
+
+        if ip.is_empty() {
+            return Err(Status::invalid_argument("ip_address required"));
+        }
+
+        // Check IP cache first
+        if let Some(r) = self.shared.ip_cache.get(&ip).await {
+            return Ok(Response::new(r));
+        }
+
+        let stdip = ip.parse::<std::net::IpAddr>()
+            .map_err(|_| Status::invalid_argument("ip_address must be an IP"))?;
+
+        // Check prefix cache for existing matches
+        {
+            let pc = self.shared.prefix_cache.read().await;
+            let mut best: Option<(u8, LookupResponse)> = None;
+
+            for e in pc.iter() {
+                if e.net.contains(&stdip) {
+                    if best.as_ref().map(|(l, _)| *l).unwrap_or(0) < e.prefix_len {
+                        best = Some((e.prefix_len, e.resp.clone()));
+                    }
+                }
+            }
+
+            if let Some((_, resp)) = best {
+                self.shared.ip_cache.insert(ip.clone(), resp.clone()).await;
+                return Ok(Response::new(resp));
+            }
+        }
+
+        // Initialize response
+        let mut resp = LookupResponse {
+            announced: false,
+            as_number: 0,
+            cidr: Vec::new(),
+            country_code: String::new(),
+            description: String::new(),
+        };
+
+        // Get data from MaxMind databases
+        let dbs = self.shared.dbs.read().await;
+
+        if let Some(db) = &dbs.country {
+            if let Ok(country_rec) = db.lookup::<geoip2::Country>(stdip) {
+                if let Some(c) = country_rec.unwrap().country {
+                    if let Some(code) = c.iso_code {
+                        resp.country_code = code.to_string();
+                    }
+                }
+            }
+        }
+
+        if let Some(db) = &dbs.asn {
+            if let Ok(asn_rec) = db.lookup::<geoip2::Asn>(stdip) {
+                let asn_data = asn_rec.clone().unwrap();
+                if let Some(asn) = asn_data.autonomous_system_number {
+                    resp.as_number = asn;
+                    resp.announced = asn != 0;
+                }
+                if let Some(org) = asn_data.autonomous_system_organization {
+                    resp.description = org.to_string();
+                }
+            }
+        }
+
+        // Try to get BGP prefix information (this may trigger external API calls)
+        match self.shared.bgp_storage.find_prefix_simple(stdip).await {
+            Some(bgp_prefix) => {
+                resp.cidr.push(bgp_prefix.prefix.to_string());
+
+                // Use BGP data if MaxMind data is missing
+                if resp.as_number == 0 {
+                    resp.as_number = bgp_prefix.asn;
+                    resp.announced = bgp_prefix.asn != 0;
+                }
+
+                if resp.description.is_empty() && !bgp_prefix.description.is_empty() {
+                    resp.description = bgp_prefix.description;
+                }
+
+                if resp.country_code.is_empty() && !bgp_prefix.country_code.is_empty() {
+                    resp.country_code = bgp_prefix.country_code;
+                }
+
+                // Cache the prefix for future lookups
+                let prefix_len = match bgp_prefix.prefix {
+                    IpNet::V4(n) => n.prefix_len(),
+                    IpNet::V6(n) => n.prefix_len(),
+                };
+
+                let entry = PrefixEntry {
+                    net: bgp_prefix.prefix,
+                    resp: resp.clone(),
+                    prefix_len
+                };
+
+                let mut pc = self.shared.prefix_cache.write().await;
+                if !pc.iter().any(|e| e.net == entry.net) {
+                    pc.push(entry);
+
+                    // Limit prefix cache size
+                    if pc.len() > 1000 {
+                        pc.sort_by(|a, b| b.prefix_len.cmp(&a.prefix_len));
+                        pc.truncate(800);
+                    }
+                }
+            }
+            None => {
+                debug!("No BGP prefix found for {}", ip);
+            }
+        }
+
+        // Cache the final result
+        self.shared.ip_cache.insert(ip.clone(), resp.clone()).await;
+        Ok(Response::new(resp))
+    }
+}
+
+#[derive(Clone)]
+struct ReputeSvc {
+    shared: Shared,
+}
+
+#[tonic::async_trait]
+impl ReputeService for ReputeSvc {
+    async fn query(&self, req: Request<ReputeServiceQueryRequest>) -> Result<Response<ReputeServiceQueryResponse>, Status> {
+        self.shared.check_auth(req.metadata())?;
+        let req_in = req.into_inner();
+        let ip = req_in.ip_address;
+
+        if ip.is_empty() {
+            return Err(Status::invalid_argument("ip_address required"));
+        }
+
+        // Reuse the IP-to-ASN lookup logic
+        let lookup_req = LookupRequest { ip_address: ip.clone() };
+        let ip_svc = IpToAsnSvc { shared: self.shared.clone() };
+        let lookup_resp = ip_svc.lookup(Request::new(lookup_req)).await?.into_inner();
+
+        let rep = ReputeServiceQueryResponse {
+            has_match: false,
+            ip_lists: Vec::<IpList>::new(),
+            suggested_challenge: String::new(),
+            asn_info: Some(lookup_resp),
+        };
+
+        Ok(Response::new(rep))
+    }
+}
+
+/// Reload MaxMind databases from disk
+async fn reload_mmdbs(shared: &Shared, db_dir: &PathBuf) -> anyhow::Result<()> {
+    let country_path = db_dir.join("GeoLite2-Country.mmdb");
+    let asn_path = db_dir.join("GeoLite2-ASN.mmdb");
+
+    let new_country = if country_path.exists() {
+        Some(Arc::new(Reader::open_readfile(&country_path)?))
+    } else {
+        None
+    };
+
+    let new_asn = if asn_path.exists() {
+        Some(Arc::new(Reader::open_readfile(&asn_path)?))
+    } else {
+        None
+    };
+
+    // Update databases atomically
+    let mut dbs = shared.dbs.write().await;
+    dbs.country = new_country;
+    dbs.asn = new_asn;
+    drop(dbs);
+
+    // Clear caches to ensure fresh data
+    shared.prefix_cache.write().await.clear();
+    shared.ip_cache.invalidate_all();
+
+    info!("MaxMind databases reloaded successfully");
+    Ok(())
+}
+
+/// Setup cron scheduler for BGP data updates
+async fn cron(bgp_storage: BgpStorage) -> anyhow::Result<JobScheduler> {
+    let scheduler = JobScheduler::new().await?;
+
+    // Daily BGP update at 02:00 UTC
+    scheduler.add(
+        Job::new_async("0 0 2 * * *", move |_uuid, _l| {
+            let storage = bgp_storage.clone();
+            Box::pin(async move {
+                info!("Starting scheduled BGP data update");
+                match storage.update_bgp_data().await {
+                    Ok(()) => info!("Scheduled BGP update completed successfully"),
+                    Err(e) => error!("Scheduled BGP update failed: {}", e),
+                }
+            })
+        })?
+    ).await?;
+
+    scheduler.start().await?;
+    info!("BGP update scheduler started (daily at 02:00 UTC)");
+
+    Ok(scheduler)
+}
+
+/// Setup signal handlers for graceful shutdown and reloads
+async fn setup_signal_handlers(shared: Shared, db_dir: PathBuf) {
+    // SIGHUP handler for manual reloads
+    let shared_sighup = shared.clone();
+    let db_dir_sighup = db_dir.clone();
+
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut stream = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Could not bind SIGHUP handler: {}", e);
+                return;
+            }
+        };
+
+        while stream.recv().await.is_some() {
+            info!("SIGHUP received: reloading databases and triggering BGP update");
+
+            // Reload MaxMind databases
+            if let Err(e) = reload_mmdbs(&shared_sighup, &db_dir_sighup).await {
+                error!("MaxMind database reload failed: {}", e);
+            }
+
+            // Trigger BGP data update
+            if let Err(e) = shared_sighup.bgp_storage.update_bgp_data().await {
+                error!("BGP data update failed: {}", e);
+            } else {
+                info!("Manual BGP data update completed successfully");
+            }
+        }
+    });
+
+    // SIGUSR1 handler for cache statistics
+    let shared_stats = shared.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut stream = match signal(SignalKind::user_defined1()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Could not bind SIGUSR1 handler: {}", e);
+                return;
+            }
+        };
+
+        while stream.recv().await.is_some() {
+            let ip_cache_stats = (
+                shared_stats.ip_cache.entry_count(),
+                shared_stats.ip_cache.weighted_size()
+            );
+            let prefix_cache_len = shared_stats.prefix_cache.read().await.len();
+            let bgp_cache_stats = shared_stats.bgp_storage.get_cache_stats();
+
+            info!("Cache Statistics:");
+            info!("  IP Cache: {} entries, {} bytes", ip_cache_stats.0, ip_cache_stats.1);
+            info!("  Prefix Cache: {} entries", prefix_cache_len);
+            info!("  BGP Cache: {} entries, {} bytes", bgp_cache_stats.0, bgp_cache_stats.1);
+        }
+    });
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Initialize logging
+    tracing_subscriber::fmt::init();
+
+    // Load configuration from environment
+    let db_dir = env::var("GEOIP_DB_DIR").unwrap_or_else(|_| "/srv/geo".to_string());
+    let port: u16 = env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(50051);
+    let token = env::var("TOKEN").ok();
+    let cache_ttl_secs: u64 = env::var("CACHE_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    let database_path = env::var("BGP_DATABASE_PATH")
+        .unwrap_or_else(|_| "sqlite:bgp_data.db".to_string());
+
+    info!("Starting GeoIP service with configuration:");
+    info!("  MaxMind DB directory: {}", db_dir);
+    info!("  BGP database: {}", database_path);
+    info!("  Port: {}", port);
+    info!("  Cache TTL: {} seconds", cache_ttl_secs);
+    info!("  Authentication: {}", if token.is_some() { "enabled" } else { "disabled" });
+
+    // Initialize MaxMind databases
+    let db_dir_path = PathBuf::from(&db_dir);
+    let country_path = db_dir_path.join("GeoLite2-Country.mmdb");
+    let asn_path = db_dir_path.join("GeoLite2-ASN.mmdb");
+
+    let country = if country_path.exists() {
+        info!("Loading MaxMind Country database: {:?}", country_path);
+        Some(Arc::new(Reader::open_readfile(&country_path)
+            .with_context(|| format!("Failed to open country database: {:?}", country_path))?))
+    } else {
+        warn!("MaxMind Country database not found: {:?}", country_path);
+        None
+    };
+
+    let asn = if asn_path.exists() {
+        info!("Loading MaxMind ASN database: {:?}", asn_path);
+        Some(Arc::new(Reader::open_readfile(&asn_path)
+            .with_context(|| format!("Failed to open ASN database: {:?}", asn_path))?))
+    } else {
+        warn!("MaxMind ASN database not found: {:?}", asn_path);
+        None
+    };
+
+    // Initialize shared state
+    let shared = Shared::new(
+        Dbs { country, asn },
+        Duration::from_secs(cache_ttl_secs),
+        token,
+        &database_path
+    ).await.context("Failed to initialize shared state")?;
+
+    // Setup BGP data scheduler
+    let _scheduler = cron(shared.bgp_storage.clone()).await
+        .context("Failed to setup BGP scheduler")?;
+
+    // Setup signal handlers
+    setup_signal_handlers(shared.clone(), db_dir_path).await;
+
+    // Create gRPC services
+    let ip_svc = IpToAsnSvc { shared: shared.clone() };
+    let rep_svc = ReputeSvc { shared: shared.clone() };
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    info!("Starting gRPC server on {}", addr);
+
+    // Start the server with graceful shutdown
+    Server::builder()
+        .add_service(IpToAsnServiceServer::new(ip_svc))
+        .add_service(ReputeServiceServer::new(rep_svc))
+        .serve_with_shutdown(addr, async {
+            signal::ctrl_c().await.expect("Failed to listen for ctrl-c");
+            info!("Shutdown signal received, stopping server gracefully...");
+        })
+        .await
+        .context("gRPC server failed")?;
+
+    info!("Server stopped");
+    Ok(())
+}

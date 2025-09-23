@@ -1,0 +1,30 @@
+syntax = "proto3";
+package buf.validate;
+
+import "google/protobuf/descriptor.proto";
+
+// Minimal stub to satisfy (buf.validate.field) usage in upstream protos.
+// We provide a small shape matching common usage: `required` and `cel`.
+// It's intentionally minimal — runtime validation is NOT implemented here.
+
+message Cel {
+  string id = 1;
+  string message = 2;
+  string expression = 3;
+}
+
+message Field {
+  // Common flag used in upstream protos
+  bool required = 1;
+
+  // CEL expression block used in upstream protos
+  Cel cel = 2;
+}
+
+// Register extension on FieldOptions so that syntax like
+//   string ip_address = 1 [(buf.validate.field).required = true, (buf.validate.field).cel = { ... }];
+// compiles correctly.
+extend google.protobuf.FieldOptions {
+  // use a high-numbered tag to avoid collisions with well-known options
+  Field field = 51234;
+}
