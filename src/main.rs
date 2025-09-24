@@ -164,9 +164,10 @@ impl BgpStorage {
     async fn init_db(&self) -> anyhow::Result<()> {
         info!("Initializing database schema...");
 
-        let create_table_sql = match self.db_type {
+        match self.db_type {
             DatabaseType::Postgres => {
-                r#"
+                let statements = [
+                    r#"
                 CREATE TABLE IF NOT EXISTS bgp_prefixes (
                     id SERIAL PRIMARY KEY,
                     prefix TEXT NOT NULL UNIQUE,
@@ -176,16 +177,21 @@ impl BgpStorage {
                     registry TEXT NOT NULL DEFAULT '',
                     last_updated TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
                     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-                );
+                )
+                "#,
+                    "CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_prefix ON bgp_prefixes (prefix)",
+                    "CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_asn ON bgp_prefixes (asn)",
+                    "CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_updated ON bgp_prefixes (last_updated)",
+                    "CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_country ON bgp_prefixes (country_code)",
+                ];
 
-                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_prefix ON bgp_prefixes (prefix);
-                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_asn ON bgp_prefixes (asn);
-                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_updated ON bgp_prefixes (last_updated);
-                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_country ON bgp_prefixes (country_code);
-                "#
+                for statement in statements {
+                    sqlx::query(statement).execute(&self.pool).await?;
+                }
             }
             DatabaseType::Sqlite => {
-                r#"
+                // SQLite can handle multiple statements in one query
+                let create_table_sql = r#"
                 CREATE TABLE IF NOT EXISTS bgp_prefixes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     prefix TEXT NOT NULL UNIQUE,
@@ -201,10 +207,10 @@ impl BgpStorage {
                 CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_asn ON bgp_prefixes (asn);
                 CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_updated ON bgp_prefixes (last_updated);
                 CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_country ON bgp_prefixes (country_code);
-                "#
+            "#;
+                sqlx::query(create_table_sql).execute(&self.pool).await?;
             }
-        };
-        sqlx::query(create_table_sql).execute(&self.pool).await?;
+        }
 
         info!("Database schema initialized successfully");
         Ok(())

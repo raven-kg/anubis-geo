@@ -1,4 +1,6 @@
 .idea/
-/target
+/target/*
+/data/*
 Cargo.lock
 GeoIP.conf
+descriptor.bin

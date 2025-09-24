@@ -11,10 +11,10 @@ services:
         source: /usr/share/GeoIP
         target: /usr/share/GeoIP
         read_only: true
-#      - type: bind
-#        source: data
-#        target: /work
-#        read_only: false
+      - type: bind
+        source: data
+        target: /work
+        read_only: false
     environment:
       - RUST_BACKTRACE=full
       - GEOIP_DB_DIR="/usr/share/GeoIP/"
