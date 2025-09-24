@@ -7,8 +7,9 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status, metadata::MetadataMap};
 use tracing::{info, warn, error, debug};
-use sqlx::{SqlitePool, Row, Executor};
+use sqlx::{Any, Postgres, Sqlite, AnyPool, Row, Database, any::AnyPoolOptions};
 use tokio_cron_scheduler::{JobScheduler, Job};
+use tonic_reflection::server::Builder as ReflectionBuilder;
 use bzip2::read::BzDecoder;
 
 pub mod techaro {
@@ -35,6 +36,38 @@ use techaro::thoth::reputation::v1::{
     ReputeServiceQueryRequest, ReputeServiceQueryResponse, IpList,
 };
 
+/// Database type enum
+#[derive(Debug, Clone, Copy)]
+enum DatabaseType {
+    Sqlite,
+    Postgres,
+}
+
+/// Simple row type for BGP data
+#[derive(Debug, Clone)]
+struct BgpRow {
+    prefix: String,
+    asn: i64,
+    description: String,
+    country_code: String,
+    registry: String,
+    last_updated: String,
+}
+
+impl BgpRow {
+    fn to_bgp_prefix(&self) -> Result<BgpPrefix, anyhow::Error> {
+        let prefix = self.prefix.parse::<IpNet>()?;
+        Ok(BgpPrefix {
+            prefix,
+            asn: self.asn as u32,
+            description: self.description.clone(),
+            country_code: self.country_code.clone(),
+            registry: self.registry.clone(),
+            last_updated: chrono::DateTime::parse_from_rfc3339(&self.last_updated)?.with_timezone(&chrono::Utc),
+        })
+    }
+}
+
 /// BGP prefix information stored in database
 #[derive(Clone, Debug)]
 struct BgpPrefix {
@@ -44,26 +77,6 @@ struct BgpPrefix {
     country_code: String,
     registry: String,
     last_updated: chrono::DateTime<chrono::Utc>,
-}
-
-impl BgpPrefix {
-    /// Create from database row
-    fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
-        let prefix_str: String = row.try_get("prefix")?;
-        let prefix = prefix_str.parse::<IpNet>()
-            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-
-        Ok(BgpPrefix {
-            prefix,
-            asn: row.try_get::<i64, _>("asn")? as u32,
-            description: row.try_get("description")?,
-            country_code: row.try_get("country_code")?,
-            registry: row.try_get("registry")?,
-            last_updated: chrono::DateTime::parse_from_rfc3339(&row.try_get::<String, _>("last_updated")?)
-                .map_err(|e| sqlx::Error::Decode(Box::new(e)))?
-                .with_timezone(&chrono::Utc),
-        })
-    }
 }
 
 /// Cached BGP lookup result with TTL
@@ -91,53 +104,126 @@ impl CachedBgpResult {
 /// BGP data storage and caching layer
 #[derive(Clone)]
 struct BgpStorage {
-    pool: SqlitePool,
+    pool: sqlx::AnyPool,
+    db_type: DatabaseType,
     client: reqwest::Client,
     /// Cache for IP -> BGP prefix lookups (short-lived, 5-10 minutes)
     lookup_cache: Cache<std::net::IpAddr, CachedBgpResult>,
 }
 
 impl BgpStorage {
-    /// Initialize BGP storage with SQLite database
-    async fn new(database_path: &str) -> anyhow::Result<Self> {
-        let pool = SqlitePool::connect(database_path).await?;
-        let pool2 = pool.clone();
-        // Create tables if they don't exist
-        pool2.execute(
-            r#"
-            CREATE TABLE IF NOT EXISTS bgp_prefixes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prefix TEXT NOT NULL UNIQUE,
-                asn INTEGER NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                country_code TEXT NOT NULL DEFAULT '',
-                registry TEXT NOT NULL DEFAULT '',
-                last_updated TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
+    /// Initialize BGP storage with database
+    async fn new(database_uri: &str) -> anyhow::Result<Self> {
+        let (pool, db_type) = if database_uri.starts_with("postgres://") || database_uri.starts_with("postgresql://") {
+            info!("Connecting to PostgreSQL database: {}", database_uri);
+            let pool = sqlx::AnyPool::connect(database_uri).await?;
+            (pool, DatabaseType::Postgres)
+        } else {
+            info!("Connecting to SQLite database: {}", database_uri);
+            if database_uri.starts_with("sqlite:") {
+                let path = database_uri.trim_start_matches("sqlite:");
+                if !std::path::Path::new(path).exists() {
+                    if let Some(parent) = std::path::Path::new(path).parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::File::create(path)?;
+                    info!("Created SQLite database file: {}", path);
+                }
+            }
 
-            CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_prefix ON bgp_prefixes (prefix);
-            CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_asn ON bgp_prefixes (asn);
-            CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_updated ON bgp_prefixes (last_updated);
-            CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_country ON bgp_prefixes (country_code);
-            "#
-        ).await?;
+            let pool = sqlx::AnyPool::connect(database_uri).await?;
+            (pool, DatabaseType::Sqlite)
+        };
 
         let storage = Self {
             pool,
+            db_type,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .user_agent("GeoIP-BGP-Service/1.0")
                 .build()?,
             lookup_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(300)) // 5 minutes TTL
-                .max_capacity(10_000) // Limit memory usage
+                .time_to_live(Duration::from_secs(300))
+                .max_capacity(10_000)
                 .build(),
         };
+
+        // Initialize database schema
+        storage.init_db().await?;
+
+        // Populate initial data
+        if storage.check_table().await? {
+            info!("Starting initial BGP data population...");
+            storage.update_bgp_data().await?;
+        }
 
         Ok(storage)
     }
 
+    /// Initialize database schema
+    async fn init_db(&self) -> anyhow::Result<()> {
+        info!("Initializing database schema...");
+
+        let create_table_sql = match self.db_type {
+            DatabaseType::Postgres => {
+                r#"
+                CREATE TABLE IF NOT EXISTS bgp_prefixes (
+                    id SERIAL PRIMARY KEY,
+                    prefix TEXT NOT NULL UNIQUE,
+                    asn INTEGER NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    country_code TEXT NOT NULL DEFAULT '',
+                    registry TEXT NOT NULL DEFAULT '',
+                    last_updated TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_prefix ON bgp_prefixes (prefix);
+                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_asn ON bgp_prefixes (asn);
+                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_updated ON bgp_prefixes (last_updated);
+                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_country ON bgp_prefixes (country_code);
+                "#
+            }
+            DatabaseType::Sqlite => {
+                r#"
+                CREATE TABLE IF NOT EXISTS bgp_prefixes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prefix TEXT NOT NULL UNIQUE,
+                    asn INTEGER NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    country_code TEXT NOT NULL DEFAULT '',
+                    registry TEXT NOT NULL DEFAULT '',
+                    last_updated TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_prefix ON bgp_prefixes (prefix);
+                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_asn ON bgp_prefixes (asn);
+                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_updated ON bgp_prefixes (last_updated);
+                CREATE INDEX IF NOT EXISTS idx_bgp_prefixes_country ON bgp_prefixes (country_code);
+                "#
+            }
+        };
+        sqlx::query(create_table_sql).execute(&self.pool).await?;
+
+        info!("Database schema initialized successfully");
+        Ok(())
+    }
+
+    /// Check if we should populate initial BGP data
+    async fn check_table(&self) -> anyhow::Result<bool> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bgp_prefixes")
+            .fetch_one(&self.pool)
+            .await?;
+
+        if count == 0 {
+            info!("Database is empty, will populate with initial BGP data");
+            Ok(true)
+        } else {
+            info!("Database contains {} BGP prefixes", count);
+            Ok(false)
+        }
+    }
     /// Find the most specific BGP prefix for an IP address
     async fn find_prefix(&self, ip: std::net::IpAddr) -> anyhow::Result<Option<BgpPrefix>> {
         // Check cache first
@@ -152,21 +238,36 @@ impl BgpStorage {
 
         // Query database for matching prefixes
         let ip_str = ip.to_string();
-        let rows = sqlx::query(
-            "SELECT prefix, asn, description, country_code, registry, last_updated
-            FROM bgp_prefixes
-            WHERE ? BETWEEN inet_aton(substr(prefix, 1, instr(prefix, '/') - 1))
-                AND inet_aton(substr(prefix, 1, instr(prefix, '/') - 1)) +
-                    (CASE WHEN substr(prefix, instr(prefix, '/') + 1) = '32' THEN 0
-                          ELSE (1 << (32 - CAST(substr(prefix, instr(prefix, '/') + 1) AS INTEGER))) - 1 END)
-            ORDER BY CAST(substr(prefix, instr(prefix, '/') + 1) AS INTEGER) DESC
-            LIMIT 1"
-        )
-            .bind(ip_str)
+        let query = match self.db_type {
+            DatabaseType::Sqlite =>
+                r#"
+                SELECT prefix, asn, description, country_code, registry, last_updated
+                FROM bgp_prefixes
+                WHERE ? BETWEEN inet_aton(substr(prefix, 1, instr(prefix, '/') - 1))
+                    AND inet_aton(substr(prefix, 1, instr(prefix, '/') - 1)) +
+                        (CASE WHEN substr(prefix, instr(prefix, '/') + 1) = '32' THEN 0
+                              ELSE (1 << (32 - CAST(substr(prefix, instr(prefix, '/') + 1) AS INTEGER))) - 1 END)
+                ORDER BY CAST(substr(prefix, instr(prefix, '/') + 1) AS INTEGER) DESC
+                LIMIT 1
+                "#,
+            DatabaseType::Postgres =>
+                r#"
+                SELECT prefix, asn, description, country_code, registry, last_updated
+                FROM bgp_prefixes
+                WHERE inet(?) <<= inet(prefix)
+                ORDER BY masklen(inet(prefix)) DESC
+                LIMIT 1
+                "#,
+        };
+
+        let rows: Vec<(String, i64, String, String, String, String)> = sqlx::query_as(query)
+            .bind(&ip_str)
             .fetch_all(&self.pool)
             .await?;
-        let prefix = if let Some(row) = rows.first() {
-            match BgpPrefix::from_row(row) {
+
+        let bgp_rows: Vec<BgpRow> = rows.into_iter().map(|(prefix, asn, desc, cc, reg, updated)| BgpRow { prefix, asn, description: desc, country_code: cc, registry: reg, last_updated: updated }).collect();
+        let prefix = if let Some(row) = bgp_rows.first() {
+            match row.to_bgp_prefix() {
                 Ok(prefix) => Some(prefix),
                 Err(e) => {
                     warn!("Failed to parse BGP prefix from row: {}", e);
@@ -176,13 +277,6 @@ impl BgpStorage {
         } else {
             None
         };
-        /*let prefix = match rows {
-            Ok(mut prefixes) => prefixes.pop(),
-            Err(e) => {
-                warn!("Database query error for {}: {}", ip, e);
-                None
-            }
-        };*/
 
         // If no result in DB, try to fetch from external APIs
         let final_prefix = if prefix.is_none() {
@@ -330,13 +424,28 @@ impl BgpStorage {
 
     /// Store BGP prefix in database
     async fn store_prefix(&self, prefix: &BgpPrefix) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            INSERT OR REPLACE INTO bgp_prefixes
-            (prefix, asn, description, country_code, registry, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?)
-            "#
-        )
+        let query = match self.db_type {
+            DatabaseType::Sqlite =>
+                r#"
+                INSERT OR REPLACE INTO bgp_prefixes
+                (prefix, asn, description, country_code, registry, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?)
+                "#,
+            DatabaseType::Postgres =>
+                r#"
+                INSERT INTO bgp_prefixes
+                (prefix, asn, description, country_code, registry, last_updated)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (prefix) DO UPDATE SET
+                    asn = EXCLUDED.asn,
+                    description = EXCLUDED.description,
+                    country_code = EXCLUDED.country_code,
+                    registry = EXCLUDED.registry,
+                    last_updated = EXCLUDED.last_updated
+                "#,
+        };
+
+        sqlx::query(query)
             .bind(prefix.prefix.to_string())
             .bind(prefix.asn as i64)
             .bind(&prefix.description)
@@ -547,7 +656,11 @@ impl BgpStorage {
         let mut tx = self.pool.begin().await?;
 
         // Clean up old data (older than 30 days)
-        sqlx::query("DELETE FROM bgp_prefixes WHERE last_updated < datetime('now', '-30 days')")
+        let cleanup_query = match self.db_type {
+            DatabaseType::Sqlite => "DELETE FROM bgp_prefixes WHERE last_updated < datetime('now', '-30 days')",
+            DatabaseType::Postgres => "DELETE FROM bgp_prefixes WHERE last_updated < NOW() - INTERVAL '30 days'",
+        };
+        sqlx::query(cleanup_query)
             .execute(&mut *tx)
             .await?;
 
@@ -559,13 +672,30 @@ impl BgpStorage {
             info!("Inserting batch {}/{} ({} prefixes)", batch_idx + 1, total_batches, chunk.len());
 
             for prefix in chunk {
-                sqlx::query(
+                let query = match self.db_type {
+                    DatabaseType::Postgres => {
                     r#"
+                    INSERT INTO bgp_prefixes
+                    (prefix, asn, description, country_code, registry, last_updated)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (prefix) DO UPDATE SET
+                        asn = EXCLUDED.asn,
+                        description = EXCLUDED.description,
+                        country_code = EXCLUDED.country_code,
+                        registry = EXCLUDED.registry,
+                        last_updated = EXCLUDED.last_updated
+                    "#
+                    }
+                    DatabaseType::Sqlite => {
+                        r#"
                     INSERT OR REPLACE INTO bgp_prefixes
                     (prefix, asn, description, country_code, registry, last_updated)
                     VALUES (?, ?, ?, ?, ?, ?)
                     "#
-                )
+                    }
+                };
+
+                sqlx::query(query)
                     .bind(prefix.prefix.to_string())
                     .bind(prefix.asn as i64)
                     .bind(&prefix.description)
@@ -916,20 +1046,23 @@ async fn setup_signal_handlers(shared: Shared, db_dir: PathBuf) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // force compiler to include drivers
+    sqlx::any::install_default_drivers();
+
     // Initialize logging
     tracing_subscriber::fmt::init();
 
     // Load configuration from environment
-    let db_dir = env::var("GEOIP_DB_DIR").unwrap_or_else(|_| "/srv/geo".to_string());
+    let db_dir = env::var("GEOIP_DB_DIR").unwrap_or_else(|_| "/usr/share/GeoIP".to_string());
     let port: u16 = env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(50051);
     let token = env::var("TOKEN").ok();
     let cache_ttl_secs: u64 = env::var("CACHE_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
-    let database_path = env::var("BGP_DATABASE_PATH")
+    let database_uri = env::var("DATABASE_URI")
         .unwrap_or_else(|_| "sqlite:bgp_data.db".to_string());
 
     info!("Starting GeoIP service with configuration:");
     info!("  MaxMind DB directory: {}", db_dir);
-    info!("  BGP database: {}", database_path);
+    info!("  Database URI: {}", database_uri);
     info!("  Port: {}", port);
     info!("  Cache TTL: {} seconds", cache_ttl_secs);
     info!("  Authentication: {}", if token.is_some() { "enabled" } else { "disabled" });
@@ -962,7 +1095,7 @@ async fn main() -> anyhow::Result<()> {
         Dbs { country, asn },
         Duration::from_secs(cache_ttl_secs),
         token,
-        &database_path
+        &database_uri
     ).await.context("Failed to initialize shared state")?;
 
     // Setup BGP data scheduler
@@ -979,10 +1112,18 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Starting gRPC server on {}", addr);
 
+    static FILE_DESCRIPTOR_SET: &'static [u8] = include_bytes!("../proto/descriptor.bin");
+
+    let reflection_service = ReflectionBuilder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .build()
+        .unwrap();
+
     // Start the server with graceful shutdown
     Server::builder()
         .add_service(IpToAsnServiceServer::new(ip_svc))
         .add_service(ReputeServiceServer::new(rep_svc))
+        .add_service(reflection_service)
         .serve_with_shutdown(addr, async {
             signal::ctrl_c().await.expect("Failed to listen for ctrl-c");
             info!("Shutdown signal received, stopping server gracefully...");

@@ -1,0 +1,42 @@
+x-geo-defaults: &geo_defaults
+  image: anubis-geo-local
+  build:
+    context: .
+    dockerfile: Dockerfile
+services:
+  geo:
+    <<: *geo_defaults
+    volumes:
+      - type: bind
+        source: /usr/share/GeoIP
+        target: /usr/share/GeoIP
+        read_only: true
+#      - type: bind
+#        source: data
+#        target: /work
+#        read_only: false
+    environment:
+      - RUST_BACKTRACE=full
+      - GEOIP_DB_DIR="/usr/share/GeoIP/"
+      - PORT=50051
+      - DATABASE_URI=sqlite:/work/bgp_data.db
+      - TOKEN=super-duper-complex-passphrase-string
+    restart: always
+    ports:
+      - "50051:50051"
+    command:
+      - /usr/local/bin/anubis-geo
+# Comment out /usr/share/GeoIP volume definition in geo to use cron
+#  cron:
+#    <<: *geo_defaults
+#    volumes:
+#      - type: bind
+#        source: GeoIP.conf
+#        target: /etc/GeoIP.conf
+#        read_only: true
+#      - type: bind
+#        source: geoipupdate.cron
+#        target: /etc/cron.daily/geoipupdate
+#    command:
+#      - /usr/sbin/crond -s -n
+#    restart: always
