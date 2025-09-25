@@ -21,6 +21,7 @@ services:
       - PORT=50051
       - DATABASE_URI=sqlite:/work/bgp_data.db
       - TOKEN=super-duper-complex-passphrase-string
+      - METRICS_PORT=9090
     restart: always
     ports:
       - "50051:50051"

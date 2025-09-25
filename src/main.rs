@@ -9,10 +9,16 @@ use tonic::{transport::Server, Request, Response, Status, metadata::MetadataMap}
 use tonic::service::Interceptor;
 use tonic::codec::CompressionEncoding;
 use tracing::{info, warn, error, debug};
-use sqlx::{Any, Postgres, Sqlite, AnyPool, Row, Database, any::AnyPoolOptions};
+use sqlx::Row;
 use tokio_cron_scheduler::{JobScheduler, Job};
 use tonic_reflection::server::Builder as ReflectionBuilder;
 use bzip2::read::BzDecoder;
+// Prometheus metrics
+use prometheus::{
+    Counter, Histogram, Gauge, Registry, TextEncoder, Encoder,
+    opts, register_counter_with_registry, register_histogram_with_registry,
+    register_gauge_with_registry, HistogramOpts,
+};
 
 pub mod techaro {
     pub mod thoth {
@@ -791,15 +797,161 @@ impl Shared {
     }
 }
 
+/// Prometheus metrics collection
+#[derive(Clone)]
+struct Metrics {
+    registry: Registry,
+    // Request counters
+    requests_total: Counter,
+    requests_failed: Counter,
+    // Request duration
+    request_duration: Histogram,
+    // Cache metrics
+    cache_hits: Counter,
+    cache_misses: Counter,
+    // BGP metrics
+    bgp_lookups_total: Counter,
+    bgp_api_calls: Counter,
+    bgp_prefixes_stored: Counter,
+    // Database metrics
+    db_queries_total: Counter,
+    db_query_duration: Histogram,
+    // System metrics
+    active_connections: Gauge,
+    uptime_seconds: Gauge,
+}
+
+impl Metrics {
+    fn new() -> anyhow::Result<Self> {
+        let registry = Registry::new();
+
+        let requests_total = register_counter_with_registry!(
+            opts!("grpc_requests_total", "Total number of gRPC requests"),
+            registry
+        )?;
+
+        let requests_failed = register_counter_with_registry!(
+            opts!("grpc_requests_failed_total", "Total number of failed gRPC requests"),
+            registry
+        )?;
+
+        let request_duration = register_histogram_with_registry!(
+            HistogramOpts::new("grpc_request_duration_seconds", "Request duration in seconds")
+                .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
+            registry
+        )?;
+
+        let cache_hits = register_counter_with_registry!(
+            opts!("cache_hits_total", "Total number of cache hits"),
+            registry
+        )?;
+
+        let cache_misses = register_counter_with_registry!(
+            opts!("cache_misses_total", "Total number of cache misses"),
+            registry
+        )?;
+
+        let bgp_lookups_total = register_counter_with_registry!(
+            opts!("bgp_lookups_total", "Total number of BGP lookups"),
+            registry
+        )?;
+
+        let bgp_api_calls = register_counter_with_registry!(
+            opts!("bgp_api_calls_total", "Total number of external BGP API calls"),
+            registry
+        )?;
+
+        let bgp_prefixes_stored = register_counter_with_registry!(
+            opts!("bgp_prefixes_stored_total", "Total number of BGP prefixes stored"),
+            registry
+        )?;
+
+        let db_queries_total = register_counter_with_registry!(
+            opts!("database_queries_total", "Total number of database queries"),
+            registry
+        )?;
+
+        let db_query_duration = register_histogram_with_registry!(
+            HistogramOpts::new("database_query_duration_seconds", "Database query duration in seconds")
+                .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
+            registry
+        )?;
+
+        let active_connections = register_gauge_with_registry!(
+            opts!("active_connections", "Number of active gRPC connections"),
+            registry
+        )?;
+
+        let uptime_seconds = register_gauge_with_registry!(
+            opts!("uptime_seconds", "Service uptime in seconds"),
+            registry
+        )?;
+
+        Ok(Self {
+            registry,
+            requests_total,
+            requests_failed,
+            request_duration,
+            cache_hits,
+            cache_misses,
+            bgp_lookups_total,
+            bgp_api_calls,
+            bgp_prefixes_stored,
+            db_queries_total,
+            db_query_duration,
+            active_connections,
+            uptime_seconds,
+        })
+    }
+
+    /// Record a successful request
+    fn record_request(&self, _method: &str, duration: Duration, success: bool) {
+        self.requests_total.inc();
+        if !success {
+            self.requests_failed.inc();
+        }
+        self.request_duration.observe(duration.as_secs_f64());
+    }
+
+    /// Record cache hit/miss
+    fn record_cache_hit(&self, hit: bool) {
+        if hit {
+            self.cache_hits.inc();
+        } else {
+            self.cache_misses.inc();
+        }
+    }
+
+    /// Record BGP lookup
+    fn record_bgp_lookup(&self, external_api_called: bool) {
+        self.bgp_lookups_total.inc();
+        if external_api_called {
+            self.bgp_api_calls.inc();
+        }
+    }
+
+    /// Record database query
+    fn record_db_query(&self, duration: Duration) {
+        self.db_queries_total.inc();
+        self.db_query_duration.observe(duration.as_secs_f64());
+    }
+
+    /// Get metrics as Prometheus text format
+    fn export(&self) -> anyhow::Result<String> {
+        let encoder = TextEncoder::new();
+        let metric_families = self.registry.gather();
+        let mut buffer = Vec::new();
+        encoder.encode(&metric_families, &mut buffer)?;
+        Ok(String::from_utf8(buffer)?)
+    }
+}
+
 /// Logging interceptor for access logs
 #[derive(Clone)]
 struct LoggingInterceptor;
 
 impl Interceptor for LoggingInterceptor {
     fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
-        let start_time = std::time::Instant::now();
-
-        // Extract metadata for logging
         let method = request
             .metadata()
             .get(":path")
@@ -830,13 +982,17 @@ impl Interceptor for LoggingInterceptor {
 }
 
 /// Response logging middleware
-fn log_response(method: &str, remote_addr: &str, status: &Status, duration: Duration) {
+fn log_response(method: &str, remote_addr: &str, status: &Status, duration: Duration, metrics: Option<&Metrics>) {
     info!(remote_addr = %remote_addr, method = %method, status_code = %status.code(), duration_ms = %duration.as_millis(), "gRPC response");
+    if let Some(m) = metrics {
+        m.record_request(method, duration, status.code() == tonic::Code::Ok);
+    }
 }
 
 #[derive(Clone)]
 struct IpToAsnSvc {
     shared: Shared,
+    metrics: Arc<Metrics>,
 }
 
 #[tonic::async_trait]
@@ -847,7 +1003,7 @@ impl IpToAsnService for IpToAsnSvc {
 
         // Check authentication
         if let Err(status) = self.shared.check_auth(req.metadata()) {
-            log_response("lookup", &remote_addr, &status, start_time.elapsed());
+            log_response("lookup", &remote_addr, &status, start_time.elapsed(), Some(&self.metrics));
             return Err(status);
         }
 
@@ -856,7 +1012,7 @@ impl IpToAsnService for IpToAsnSvc {
 
         if ip.is_empty() {
             let status = Status::invalid_argument("ip_address is required and cannot be empty");
-            log_response("lookup", &remote_addr, &status, start_time.elapsed());
+            log_response("lookup", &remote_addr, &status, start_time.elapsed(), Some(&self.metrics));
             return Err(Status::invalid_argument("ip_address required"));
         }
 
@@ -865,7 +1021,7 @@ impl IpToAsnService for IpToAsnSvc {
             Ok(addr) => addr,
             Err(e) => {
                 let status = Status::invalid_argument(format!("Invalid IP address format: {}", e));
-                log_response("lookup", &remote_addr, &status, start_time.elapsed());
+                log_response("lookup", &remote_addr, &status, start_time.elapsed(), Some(&self.metrics));
                 return Err(status);
             }
         };
@@ -874,12 +1030,14 @@ impl IpToAsnService for IpToAsnSvc {
         match self.shared.ip_cache.get(&ip).await {
             Some(cached_response) => {
                 debug!("Cache hit for IP: {}", ip);
+                self.metrics.record_cache_hit(true);
                 let status = Status::ok("");
-                log_response("lookup", &remote_addr, &status, start_time.elapsed());
+                log_response("lookup", &remote_addr, &status, start_time.elapsed(), Some(&self.metrics));
                 return Ok(Response::new(cached_response));
             }
             None => {
                 debug!("Cache miss for IP: {}", ip);
+                self.metrics.record_cache_hit(false);
             }
         }
 
@@ -901,7 +1059,8 @@ impl IpToAsnService for IpToAsnSvc {
         if let Some(cached_resp) = cached_prefix_result {
             self.shared.ip_cache.insert(ip.clone(), cached_resp.clone()).await;
             let status = Status::ok("");
-            log_response("lookup", &remote_addr, &status, start_time.elapsed());
+            self.metrics.record_cache_hit(true);
+            log_response("lookup", &remote_addr, &status, start_time.elapsed(), Some(&self.metrics));
             return Ok(Response::new(cached_resp));
         }
 
@@ -963,6 +1122,8 @@ impl IpToAsnService for IpToAsnSvc {
 
         // Try to get BGP prefix information (this may trigger external API calls)
         let bgp_result = self.shared.bgp_storage.find_prefix_simple(stdip).await;
+        let external_api_used = bgp_result.is_some();
+        self.metrics.record_bgp_lookup(external_api_used);
         match bgp_result {
             Some(ref bgp_prefix) => {
                 debug!("Found BGP prefix for {}: {}", ip, bgp_prefix.prefix);
@@ -1021,7 +1182,7 @@ impl IpToAsnService for IpToAsnSvc {
         self.shared.ip_cache.insert(ip.clone(), resp.clone()).await;
 
         let status = Status::ok("");
-        log_response("lookup", &remote_addr, &status, start_time.elapsed());
+        log_response("lookup", &remote_addr, &status, start_time.elapsed(), Some(&self.metrics));
         Ok(Response::new(resp))
     }
 }
@@ -1029,6 +1190,7 @@ impl IpToAsnService for IpToAsnSvc {
 #[derive(Clone)]
 struct ReputeSvc {
     shared: Shared,
+    metrics: Arc<Metrics>,
 }
 
 #[tonic::async_trait]
@@ -1039,7 +1201,7 @@ impl ReputeService for ReputeSvc {
 
         // Check authentication
         if let Err(status) = self.shared.check_auth(req.metadata()) {
-            log_response("reputation_query", &remote_addr, &status, start_time.elapsed());
+            log_response("reputation_query", &remote_addr, &status, start_time.elapsed(), Some(&self.metrics));
             return Err(status);
         }
 
@@ -1050,7 +1212,7 @@ impl ReputeService for ReputeSvc {
 
         if ip.is_empty() {
             let status = Status::invalid_argument("ip_address is required and cannot be empty");
-            log_response("reputation_query", &remote_addr, &status, start_time.elapsed());
+            log_response("reputation_query", &remote_addr, &status, start_time.elapsed(), Some(&self.metrics));
             return Err(Status::invalid_argument("ip_address required"));
         }
 
@@ -1061,12 +1223,12 @@ impl ReputeService for ReputeSvc {
         // Copy metadata (including authorization)
         *lookup_request.metadata_mut() = metadata;
 
-        let ip_svc = IpToAsnSvc { shared: self.shared.clone() };
+        let ip_svc = IpToAsnSvc { shared: self.shared.clone(), metrics: self.metrics.clone() };
         let lookup_resp = match ip_svc.lookup(lookup_request).await {
             Ok(response) => response.into_inner(),
             Err(status) => {
                 error!("Failed to lookup ASN info for reputation query on IP {}: {}", ip, status);
-                log_response("reputation_query", &remote_addr, &status, start_time.elapsed());
+                log_response("reputation_query", &remote_addr, &status, start_time.elapsed(), Some(&self.metrics));
                 return Err(status);
             }
         };
@@ -1079,9 +1241,32 @@ impl ReputeService for ReputeSvc {
         };
 
         let status = Status::ok("");
-        log_response("reputation_query", &remote_addr, &status, start_time.elapsed());
+        log_response("reputation_query", &remote_addr, &status, start_time.elapsed(), Some(&self.metrics));
         Ok(Response::new(rep))
     }
+}
+
+/// Metrics HTTP server
+async fn start_metrics_server(metrics: Arc<Metrics>, port: u16) -> anyhow::Result<()> {
+    use axum::{response::Html, routing::get, Router};
+
+    let app = Router::new().route("/metrics", get({
+        let metrics = metrics.clone();
+        move || {
+            let metrics = metrics.clone();
+            async move {
+                match metrics.export() {
+                    Ok(content) => Html(content),
+                    Err(e) => Html(format!("Error generating metrics: {}", e)),
+                }
+            }
+        }
+    }));
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    info!("Starting metrics server on http://{}/metrics", addr);
+    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+    Ok(())
 }
 
 /// Reload GeoIP2 databases from disk
@@ -1245,6 +1430,7 @@ async fn main() -> anyhow::Result<()> {
     let cache_ttl_secs: u64 = env::var("CACHE_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
     let database_uri = env::var("DATABASE_URI")
         .unwrap_or_else(|_| "sqlite:bgp_data.db".to_string());
+    let metrics_port: u16 = env::var("METRICS_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(9090);
 
     info!("Starting GeoIP service with configuration:");
     info!("  GeoIP2 DB directory: {}", db_dir);
@@ -1252,6 +1438,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  Port: {}", port);
     info!("  Cache TTL: {} seconds", cache_ttl_secs);
     info!("  Authentication: {}", if token.is_some() { "enabled" } else { "disabled" });
+    info!("  Metrics port: {}", metrics_port);
 
     // Initialize GeoIP2 databases
     let db_dir_path = PathBuf::from(&db_dir);
@@ -1284,16 +1471,44 @@ async fn main() -> anyhow::Result<()> {
         &database_uri
     ).await.context("Failed to initialize shared state")?;
 
+    // Initialize metrics
+    let metrics = Arc::new(Metrics::new().context("Failed to initialize metrics")?);
+
+    // Update uptime metric periodically
+    let start_time = std::time::Instant::now();
+
     // Setup BGP data scheduler
     let _scheduler = cron(shared.bgp_storage.clone()).await
         .context("Failed to setup BGP scheduler")?;
+
+    // Start metrics server
+    let metrics_server = {
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            if let Err(e) = start_metrics_server(metrics, metrics_port).await {
+                error!("Metrics server failed: {}", e);
+            }
+        })
+    };
 
     // Setup signal handlers
     setup_signal_handlers(shared.clone(), db_dir_path).await;
 
     // Create gRPC services
-    let ip_svc = IpToAsnSvc { shared: shared.clone() };
-    let rep_svc = ReputeSvc { shared: shared.clone() };
+    let ip_svc = IpToAsnSvc { shared: shared.clone(), metrics: metrics.clone() };
+    let rep_svc = ReputeSvc { shared: shared.clone(), metrics: metrics.clone() };
+
+    // Update uptime metric periodically
+    let uptime_task = {
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                metrics.uptime_seconds.set(start_time.elapsed().as_secs() as f64);
+            }
+        })
+    };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Starting gRPC server on {}", addr);
