@@ -6,6 +6,8 @@ use moka::future::Cache;
 use tokio::signal;
 use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status, metadata::MetadataMap};
+use tonic::service::Interceptor;
+use tonic::codec::CompressionEncoding;
 use tracing::{info, warn, error, debug};
 use sqlx::{Any, Postgres, Sqlite, AnyPool, Row, Database, any::AnyPoolOptions};
 use tokio_cron_scheduler::{JobScheduler, Job};
@@ -190,7 +192,6 @@ impl BgpStorage {
                 }
             }
             DatabaseType::Sqlite => {
-                // SQLite can handle multiple statements in one query
                 let create_table_sql = r#"
                 CREATE TABLE IF NOT EXISTS bgp_prefixes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -430,36 +431,46 @@ impl BgpStorage {
 
     /// Store BGP prefix in database
     async fn store_prefix(&self, prefix: &BgpPrefix) -> anyhow::Result<()> {
-        let query = match self.db_type {
-            DatabaseType::Sqlite =>
-                r#"
-                INSERT OR REPLACE INTO bgp_prefixes
-                (prefix, asn, description, country_code, registry, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?)
-                "#,
-            DatabaseType::Postgres =>
-                r#"
-                INSERT INTO bgp_prefixes
-                (prefix, asn, description, country_code, registry, last_updated)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (prefix) DO UPDATE SET
-                    asn = EXCLUDED.asn,
-                    description = EXCLUDED.description,
-                    country_code = EXCLUDED.country_code,
-                    registry = EXCLUDED.registry,
-                    last_updated = EXCLUDED.last_updated
-                "#,
-        };
+        match self.db_type {
+            DatabaseType::Sqlite => {
+                sqlx::query(
+                    r#"INSERT OR REPLACE INTO bgp_prefixes
+                    (prefix, asn, description, country_code, registry, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?)"#
+                )
+                    .bind(prefix.prefix.to_string())
+                    .bind(prefix.asn as i64)
+                    .bind(&prefix.description)
+                    .bind(&prefix.country_code)
+                    .bind(&prefix.registry)
+                    .bind(prefix.last_updated.to_rfc3339())
+                    .execute(&self.pool)
+                    .await?;
+            }
+            DatabaseType::Postgres => {
+                let query_str = format!(
+                    r#"INSERT INTO bgp_prefixes
+                    (prefix, asn, description, country_code, registry, last_updated)
+                    VALUES ($1, $2, $3, $4, $5, '{}')
+                    ON CONFLICT (prefix) DO UPDATE SET
+                        asn = EXCLUDED.asn,
+                        description = EXCLUDED.description,
+                        country_code = EXCLUDED.country_code,
+                        registry = EXCLUDED.registry,
+                        last_updated = EXCLUDED.last_updated"#,
+                    prefix.last_updated.to_rfc3339()
+                );
 
-        sqlx::query(query)
-            .bind(prefix.prefix.to_string())
-            .bind(prefix.asn as i64)
-            .bind(&prefix.description)
-            .bind(&prefix.country_code)
-            .bind(&prefix.registry)
-            .bind(prefix.last_updated.to_rfc3339())
-            .execute(&self.pool)
-            .await?;
+                sqlx::query(&query_str)
+                    .bind(prefix.prefix.to_string())
+                    .bind(prefix.asn as i64)
+                    .bind(&prefix.description)
+                    .bind(&prefix.country_code)
+                    .bind(&prefix.registry)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
 
         debug!("Stored BGP prefix {} in database", prefix.prefix);
         Ok(())
@@ -677,39 +688,49 @@ impl BgpStorage {
         for (batch_idx, chunk) in prefixes.chunks(BATCH_SIZE).enumerate() {
             info!("Inserting batch {}/{} ({} prefixes)", batch_idx + 1, total_batches, chunk.len());
 
-            for prefix in chunk {
-                let query = match self.db_type {
-                    DatabaseType::Postgres => {
-                    r#"
-                    INSERT INTO bgp_prefixes
-                    (prefix, asn, description, country_code, registry, last_updated)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (prefix) DO UPDATE SET
-                        asn = EXCLUDED.asn,
-                        description = EXCLUDED.description,
-                        country_code = EXCLUDED.country_code,
-                        registry = EXCLUDED.registry,
-                        last_updated = EXCLUDED.last_updated
-                    "#
+            match self.db_type {
+                DatabaseType::Sqlite => {
+                    for prefix in chunk {
+                        sqlx::query(
+                            r#"INSERT OR REPLACE INTO bgp_prefixes
+                            (prefix, asn, description, country_code, registry, last_updated)
+                            VALUES (?, ?, ?, ?, ?, ?)"#
+                        )
+                            .bind(prefix.prefix.to_string())
+                            .bind(prefix.asn as i64)
+                            .bind(&prefix.description)
+                            .bind(&prefix.country_code)
+                            .bind(&prefix.registry)
+                            .bind(prefix.last_updated.to_rfc3339())
+                            .execute(&mut *tx)
+                            .await?;
                     }
-                    DatabaseType::Sqlite => {
-                        r#"
-                    INSERT OR REPLACE INTO bgp_prefixes
-                    (prefix, asn, description, country_code, registry, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    "#
-                    }
-                };
+                }
+                DatabaseType::Postgres => {
+                    for prefix in chunk {
+                        let query_str = format!(
+                            r#"INSERT INTO bgp_prefixes
+                            (prefix, asn, description, country_code, registry, last_updated)
+                            VALUES ($1, $2, $3, $4, $5, '{}')
+                            ON CONFLICT (prefix) DO UPDATE SET
+                                asn = EXCLUDED.asn,
+                                description = EXCLUDED.description,
+                                country_code = EXCLUDED.country_code,
+                                registry = EXCLUDED.registry,
+                                last_updated = EXCLUDED.last_updated"#,
+                            prefix.last_updated.to_rfc3339()
+                        );
 
-                sqlx::query(query)
-                    .bind(prefix.prefix.to_string())
-                    .bind(prefix.asn as i64)
-                    .bind(&prefix.description)
-                    .bind(&prefix.country_code)
-                    .bind(&prefix.registry)
-                    .bind(prefix.last_updated.to_rfc3339())
-                    .execute(&mut *tx)
-                    .await?;
+                        sqlx::query(&query_str)
+                            .bind(prefix.prefix.to_string())
+                            .bind(prefix.asn as i64)
+                            .bind(&prefix.description)
+                            .bind(&prefix.country_code)
+                            .bind(&prefix.registry)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                }
             }
         }
 
@@ -770,6 +791,49 @@ impl Shared {
     }
 }
 
+/// Logging interceptor for access logs
+#[derive(Clone)]
+struct LoggingInterceptor;
+
+impl Interceptor for LoggingInterceptor {
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        let start_time = std::time::Instant::now();
+
+        // Extract metadata for logging
+        let method = request
+            .metadata()
+            .get(":path")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+
+        let remote_addr = request
+            .remote_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let user_agent = request
+            .metadata()
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+
+        // Log the request
+        info!(
+            remote_addr = %remote_addr,
+            method = %method,
+            user_agent = %user_agent,
+            "Incoming gRPC request"
+        );
+
+        Ok(request)
+    }
+}
+
+/// Response logging middleware
+fn log_response(method: &str, remote_addr: &str, status: &Status, duration: Duration) {
+    info!(remote_addr = %remote_addr, method = %method, status_code = %status.code(), duration_ms = %duration.as_millis(), "gRPC response");
+}
+
 #[derive(Clone)]
 struct IpToAsnSvc {
     shared: Shared,
@@ -778,23 +842,48 @@ struct IpToAsnSvc {
 #[tonic::async_trait]
 impl IpToAsnService for IpToAsnSvc {
     async fn lookup(&self, req: Request<LookupRequest>) -> Result<Response<LookupResponse>, Status> {
-        self.shared.check_auth(req.metadata())?;
-        let ip = req.into_inner().ip_address;
+        let start_time = std::time::Instant::now();
+        let remote_addr = req.remote_addr().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
+
+        // Check authentication
+        if let Err(status) = self.shared.check_auth(req.metadata()) {
+            log_response("lookup", &remote_addr, &status, start_time.elapsed());
+            return Err(status);
+        }
+
+        let request_data = req.into_inner();
+        let ip = request_data.ip_address;
 
         if ip.is_empty() {
+            let status = Status::invalid_argument("ip_address is required and cannot be empty");
+            log_response("lookup", &remote_addr, &status, start_time.elapsed());
             return Err(Status::invalid_argument("ip_address required"));
         }
 
+        // Validate IP address format
+        let stdip = match ip.parse::<std::net::IpAddr>() {
+            Ok(addr) => addr,
+            Err(e) => {
+                let status = Status::invalid_argument(format!("Invalid IP address format: {}", e));
+                log_response("lookup", &remote_addr, &status, start_time.elapsed());
+                return Err(status);
+            }
+        };
+
         // Check IP cache first
-        if let Some(r) = self.shared.ip_cache.get(&ip).await {
-            return Ok(Response::new(r));
+        match self.shared.ip_cache.get(&ip).await {
+            Some(cached_response) => {
+                debug!("Cache hit for IP: {}", ip);
+                let status = Status::ok("");
+                log_response("lookup", &remote_addr, &status, start_time.elapsed());
+                return Ok(Response::new(cached_response));
+            }
+            None => {
+                debug!("Cache miss for IP: {}", ip);
+            }
         }
 
-        let stdip = ip.parse::<std::net::IpAddr>()
-            .map_err(|_| Status::invalid_argument("ip_address must be an IP"))?;
-
-        // Check prefix cache for existing matches
-        {
+        let cached_prefix_result = {
             let pc = self.shared.prefix_cache.read().await;
             let mut best: Option<(u8, LookupResponse)> = None;
 
@@ -806,10 +895,14 @@ impl IpToAsnService for IpToAsnSvc {
                 }
             }
 
-            if let Some((_, resp)) = best {
-                self.shared.ip_cache.insert(ip.clone(), resp.clone()).await;
-                return Ok(Response::new(resp));
-            }
+            best.map(|(_, resp)| resp)
+        };
+
+        if let Some(cached_resp) = cached_prefix_result {
+            self.shared.ip_cache.insert(ip.clone(), cached_resp.clone()).await;
+            let status = Status::ok("");
+            log_response("lookup", &remote_addr, &status, start_time.elapsed());
+            return Ok(Response::new(cached_resp));
         }
 
         // Initialize response
@@ -821,49 +914,72 @@ impl IpToAsnService for IpToAsnSvc {
             description: String::new(),
         };
 
-        // Get data from MaxMind databases
+        // Get data from GeoIP2 databases
         let dbs = self.shared.dbs.read().await;
 
+        // Country lookup
         if let Some(db) = &dbs.country {
-            if let Ok(country_rec) = db.lookup::<geoip2::Country>(stdip) {
-                if let Some(c) = country_rec.unwrap().country {
-                    if let Some(code) = c.iso_code {
-                        resp.country_code = code.to_string();
+            match db.lookup::<geoip2::Country>(stdip) {
+                Ok(country_rec) => {
+                    if let Some(country_data) = country_rec {
+                        if let Some(c) = country_data.country {
+                            if let Some(code) = c.iso_code {
+                                resp.country_code = code.to_string();
+                                debug!("Found country code for {}: {}", ip, resp.country_code);
+                            }
+                        }
                     }
                 }
+                Err(e) => {
+                    debug!("GeoIP2 Country lookup failed for {}: {}", ip, e);
+                }
             }
+        } else {
+            debug!("GeoIP2 Country database not available");
         }
 
+        // ASN lookup
         if let Some(db) = &dbs.asn {
-            if let Ok(asn_rec) = db.lookup::<geoip2::Asn>(stdip) {
-                let asn_data = asn_rec.clone().unwrap();
-                if let Some(asn) = asn_data.autonomous_system_number {
-                    resp.as_number = asn;
-                    resp.announced = asn != 0;
+            match db.lookup::<geoip2::Asn>(stdip) {
+                Ok(asn_rec) => {
+                    if let Some(asn_data) = asn_rec {
+                        if let Some(asn) = asn_data.autonomous_system_number {
+                            resp.as_number = asn;
+                            resp.announced = asn != 0;
+                            debug!("Found ASN for {}: {}", ip, asn);
+                        }
+                        if let Some(org) = asn_data.autonomous_system_organization {
+                            resp.description = org.to_string();
+                        }
+                    }
                 }
-                if let Some(org) = asn_data.autonomous_system_organization {
-                    resp.description = org.to_string();
+                Err(e) => {
+                    debug!("GeoIP2 ASN lookup failed for {}: {}", ip, e);
                 }
             }
+        } else {
+            debug!("GeoIP2 ASN database not available");
         }
 
         // Try to get BGP prefix information (this may trigger external API calls)
-        match self.shared.bgp_storage.find_prefix_simple(stdip).await {
-            Some(bgp_prefix) => {
+        let bgp_result = self.shared.bgp_storage.find_prefix_simple(stdip).await;
+        match bgp_result {
+            Some(ref bgp_prefix) => {
+                debug!("Found BGP prefix for {}: {}", ip, bgp_prefix.prefix);
                 resp.cidr.push(bgp_prefix.prefix.to_string());
 
-                // Use BGP data if MaxMind data is missing
+                // Use BGP data if GeoIP2 data is missing
                 if resp.as_number == 0 {
                     resp.as_number = bgp_prefix.asn;
                     resp.announced = bgp_prefix.asn != 0;
                 }
 
                 if resp.description.is_empty() && !bgp_prefix.description.is_empty() {
-                    resp.description = bgp_prefix.description;
+                    resp.description = bgp_prefix.description.clone();
                 }
 
                 if resp.country_code.is_empty() && !bgp_prefix.country_code.is_empty() {
-                    resp.country_code = bgp_prefix.country_code;
+                    resp.country_code = bgp_prefix.country_code.clone();
                 }
 
                 // Cache the prefix for future lookups
@@ -872,30 +988,40 @@ impl IpToAsnService for IpToAsnSvc {
                     IpNet::V6(n) => n.prefix_len(),
                 };
 
-                let entry = PrefixEntry {
+                let cache_entry = PrefixEntry {
                     net: bgp_prefix.prefix,
                     resp: resp.clone(),
-                    prefix_len
+                    prefix_len,
                 };
 
-                let mut pc = self.shared.prefix_cache.write().await;
-                if !pc.iter().any(|e| e.net == entry.net) {
-                    pc.push(entry);
+                // Cache management
+                match self.shared.prefix_cache.try_write() {
+                    Ok(mut pc) => {
+                        if !pc.iter().any(|e| e.net == cache_entry.net) {
+                            pc.push(cache_entry);
 
-                    // Limit prefix cache size
-                    if pc.len() > 1000 {
-                        pc.sort_by(|a, b| b.prefix_len.cmp(&a.prefix_len));
-                        pc.truncate(800);
+                            // Limit prefix cache size
+                            if pc.len() > 1000 {
+                                pc.sort_by(|a, b| b.prefix_len.cmp(&a.prefix_len));
+                                pc.truncate(800);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to acquire prefix cache write lock: {}", e);
                     }
                 }
             }
             None => {
-                debug!("No BGP prefix found for {}", ip);
+                debug!("No BGP prefix found for {} after external lookup", ip);
             }
         }
 
         // Cache the final result
         self.shared.ip_cache.insert(ip.clone(), resp.clone()).await;
+
+        let status = Status::ok("");
+        log_response("lookup", &remote_addr, &status, start_time.elapsed());
         Ok(Response::new(resp))
     }
 }
@@ -908,18 +1034,42 @@ struct ReputeSvc {
 #[tonic::async_trait]
 impl ReputeService for ReputeSvc {
     async fn query(&self, req: Request<ReputeServiceQueryRequest>) -> Result<Response<ReputeServiceQueryResponse>, Status> {
-        self.shared.check_auth(req.metadata())?;
+        let start_time = std::time::Instant::now();
+        let remote_addr = req.remote_addr().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
+
+        // Check authentication
+        if let Err(status) = self.shared.check_auth(req.metadata()) {
+            log_response("reputation_query", &remote_addr, &status, start_time.elapsed());
+            return Err(status);
+        }
+
+        // Extract metadata before consuming req
+        let metadata = req.metadata().clone();
         let req_in = req.into_inner();
         let ip = req_in.ip_address;
 
         if ip.is_empty() {
+            let status = Status::invalid_argument("ip_address is required and cannot be empty");
+            log_response("reputation_query", &remote_addr, &status, start_time.elapsed());
             return Err(Status::invalid_argument("ip_address required"));
         }
 
         // Reuse the IP-to-ASN lookup logic
         let lookup_req = LookupRequest { ip_address: ip.clone() };
+        let mut lookup_request = Request::new(lookup_req);
+
+        // Copy metadata (including authorization)
+        *lookup_request.metadata_mut() = metadata;
+
         let ip_svc = IpToAsnSvc { shared: self.shared.clone() };
-        let lookup_resp = ip_svc.lookup(Request::new(lookup_req)).await?.into_inner();
+        let lookup_resp = match ip_svc.lookup(lookup_request).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                error!("Failed to lookup ASN info for reputation query on IP {}: {}", ip, status);
+                log_response("reputation_query", &remote_addr, &status, start_time.elapsed());
+                return Err(status);
+            }
+        };
 
         let rep = ReputeServiceQueryResponse {
             has_match: false,
@@ -928,11 +1078,13 @@ impl ReputeService for ReputeSvc {
             asn_info: Some(lookup_resp),
         };
 
+        let status = Status::ok("");
+        log_response("reputation_query", &remote_addr, &status, start_time.elapsed());
         Ok(Response::new(rep))
     }
 }
 
-/// Reload MaxMind databases from disk
+/// Reload GeoIP2 databases from disk
 async fn reload_mmdbs(shared: &Shared, db_dir: &PathBuf) -> anyhow::Result<()> {
     let country_path = db_dir.join("GeoLite2-Country.mmdb");
     let asn_path = db_dir.join("GeoLite2-ASN.mmdb");
@@ -949,7 +1101,7 @@ async fn reload_mmdbs(shared: &Shared, db_dir: &PathBuf) -> anyhow::Result<()> {
         None
     };
 
-    // Update databases atomically
+    // Update databases
     let mut dbs = shared.dbs.write().await;
     dbs.country = new_country;
     dbs.asn = new_asn;
@@ -959,7 +1111,7 @@ async fn reload_mmdbs(shared: &Shared, db_dir: &PathBuf) -> anyhow::Result<()> {
     shared.prefix_cache.write().await.clear();
     shared.ip_cache.invalidate_all();
 
-    info!("MaxMind databases reloaded successfully");
+    info!("GeoIP2 databases reloaded successfully");
     Ok(())
 }
 
@@ -1007,9 +1159,9 @@ async fn setup_signal_handlers(shared: Shared, db_dir: PathBuf) {
         while stream.recv().await.is_some() {
             info!("SIGHUP received: reloading databases and triggering BGP update");
 
-            // Reload MaxMind databases
+            // Reload GeoIP2 databases
             if let Err(e) = reload_mmdbs(&shared_sighup, &db_dir_sighup).await {
-                error!("MaxMind database reload failed: {}", e);
+                error!("GeoIP2 database reload failed: {}", e);
             }
 
             // Trigger BGP data update
@@ -1050,6 +1202,31 @@ async fn setup_signal_handlers(shared: Shared, db_dir: PathBuf) {
     });
 }
 
+/// Global error handler for unhandled errors
+fn setup_panic_handler() {
+    std::panic::set_hook(Box::new(|panic_info| {
+        let location = panic_info.location().unwrap_or_else(|| {
+            std::panic::Location::caller()
+        });
+
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+
+        error!(
+            panic.file = %location.file(),
+            panic.line = %location.line(),
+            panic.column = %location.column(),
+            panic.message = %message,
+            "Application panic occurred"
+        );
+    }));
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // force compiler to include drivers
@@ -1057,6 +1234,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize logging
     tracing_subscriber::fmt::init();
+
+    // Setup panic handler for better error reporting
+    setup_panic_handler();
 
     // Load configuration from environment
     let db_dir = env::var("GEOIP_DB_DIR").unwrap_or_else(|_| "/usr/share/GeoIP".to_string());
@@ -1067,32 +1247,32 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "sqlite:bgp_data.db".to_string());
 
     info!("Starting GeoIP service with configuration:");
-    info!("  MaxMind DB directory: {}", db_dir);
+    info!("  GeoIP2 DB directory: {}", db_dir);
     info!("  Database URI: {}", database_uri);
     info!("  Port: {}", port);
     info!("  Cache TTL: {} seconds", cache_ttl_secs);
     info!("  Authentication: {}", if token.is_some() { "enabled" } else { "disabled" });
 
-    // Initialize MaxMind databases
+    // Initialize GeoIP2 databases
     let db_dir_path = PathBuf::from(&db_dir);
     let country_path = db_dir_path.join("GeoLite2-Country.mmdb");
     let asn_path = db_dir_path.join("GeoLite2-ASN.mmdb");
 
     let country = if country_path.exists() {
-        info!("Loading MaxMind Country database: {:?}", country_path);
+        info!("Loading GeoIP2 Country database: {:?}", country_path);
         Some(Arc::new(Reader::open_readfile(&country_path)
             .with_context(|| format!("Failed to open country database: {:?}", country_path))?))
     } else {
-        warn!("MaxMind Country database not found: {:?}", country_path);
+        warn!("GeoIP2 Country database not found: {:?}", country_path);
         None
     };
 
     let asn = if asn_path.exists() {
-        info!("Loading MaxMind ASN database: {:?}", asn_path);
+        info!("Loading GeoIP2 ASN database: {:?}", asn_path);
         Some(Arc::new(Reader::open_readfile(&asn_path)
             .with_context(|| format!("Failed to open ASN database: {:?}", asn_path))?))
     } else {
-        warn!("MaxMind ASN database not found: {:?}", asn_path);
+        warn!("GeoIP2 ASN database not found: {:?}", asn_path);
         None
     };
 
@@ -1127,8 +1307,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Start the server with graceful shutdown
     Server::builder()
-        .add_service(IpToAsnServiceServer::new(ip_svc))
-        .add_service(ReputeServiceServer::new(rep_svc))
+        .layer(tower::ServiceBuilder::new().layer(tonic::service::interceptor(LoggingInterceptor)))
+        .add_service(
+            IpToAsnServiceServer::new(ip_svc)
+                .accept_compressed(CompressionEncoding::Gzip)
+        )
+        .add_service(
+            ReputeServiceServer::new(rep_svc)
+                .accept_compressed(CompressionEncoding::Gzip)
+        )
         .add_service(reflection_service)
         .serve_with_shutdown(addr, async {
             signal::ctrl_c().await.expect("Failed to listen for ctrl-c");

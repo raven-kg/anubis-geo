@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 tokio-cron-scheduler = "0.14.0"
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "time", "signal"] }
-tonic = { version = "0.11", features = ["transport"] }
+tonic = { version = "0.11", features = ["transport", "gzip"] }
 prost = "0.12"
 maxminddb = "0.26"
 moka = { version = "0.12", features = ["sync", "future"] }
@@ -16,11 +16,12 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 ipnet = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "chrono", "any"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "chrono", "any", "time"] }
 chrono = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 bzip2 = "0.6"
 tonic-reflection = "0.11"
+tower = "0.4"
 
 [build-dependencies]
 tonic-build = "0.11"
